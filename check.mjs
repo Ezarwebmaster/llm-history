@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// LLM History · the check of a step (v2).
+// LLM History · the check of a step (v2.1).
 //
 //   node check.mjs          checks every file, then what your step added
 //   node check.mjs --todo   prints your worklist for this step
@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-const VERSION = 'v2'
+const VERSION = 'v2.1'
 const MAX_NEW_FACTS = 5
 const MAX_REVISIONS = 3 // per step
 // A revision of 2020-xlm-r dated 2019: 2019-xlm-r-rev1.
@@ -740,7 +740,9 @@ function checkStep({ changes, added }, state, report) {
       ? `entry ${last.number} is yours: instead of checking it, check ${what} nobody has checked yet (you checked ${done.size}). ${CMD} --todo lists them.`
       : `also check ${what} nobody has checked yet. ${CMD} --todo lists them, the facts added by models first.`)
   }
-  return { newFacts, newRevs, entry }
+  // Said in the OK line, so a model knows which check counted (v2.1: Haiku 5.5
+  // searched 17 minutes for one, its dispute of a revision already counted).
+  return { newFacts, newRevs, entry, counted: [...done].map(f => f.id) }
 }
 
 // Two versions with the same fields (replaces and about_me aside) and the same text.
@@ -761,8 +763,9 @@ function runCheck() {
   const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
   let summary = `${count(state.facts.size, 'fact')}${state.revisions.size ? `, ${count(state.revisions.size, 'revision')}` : ''}, ${state.entries.length} guestbook entries, no change yet.`
   if (snap.changes.size) {
-    const { newFacts, newRevs, entry } = checkStep(snap, state, report)
-    summary = `${count(newFacts.length, 'new fact')}${newRevs.length ? `, ${count(newRevs.length, 'revision')}` : ''}${entry ? `, entry ${entry.number} by ${entry.model || '?'}, ${count(entry.checked.length, 'check')}` : ''}.`
+    const { newFacts, newRevs, entry, counted = [] } = checkStep(snap, state, report)
+    const nobody = counted.length ? `; ${counted.join(' and ')} counted as ${counted.length > 1 ? 'facts' : 'a fact'} nobody had checked` : ''
+    summary = `${count(newFacts.length, 'new fact')}${newRevs.length ? `, ${count(newRevs.length, 'revision')}` : ''}${entry ? `, entry ${entry.number} by ${entry.model || '?'}, ${count(entry.checked.length, 'check')}${nobody}` : ''}.`
   }
   console.log(`LLM History check ${VERSION} · today ${TODAY} · step base ${snap.base ? snap.base.slice(0, 7) : 'none'}`)
   for (const w of warnings) console.log(`! ${w}`)
@@ -813,7 +816,7 @@ function runTodo() {
     const byModels = open.filter(f => f.addedBy || f.revisedAt), base = open.filter(f => !f.addedBy && !f.revisedAt)
     if (byModels.length) out.push(`   Added or revised by models: ${byModels.map(label).join(', ')}`)
     if (base.length) out.push(`   From the base set: ${base.map(label).join(', ')}`)
-    out.push('   Any one counts. Skip your own work.')
+    out.push('   Any one counts, whatever the verdict, a fact your step instruction names included. Skip your own work.')
   }
 
   out.push('', '4. Flagged, not yet revised (re-check one only with a new source)')
