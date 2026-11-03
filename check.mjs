@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// LLM History · the check of a step (v2.1).
+// LLM History · the check of a step (v2.2).
 //
 //   node check.mjs          checks every file, then what your step added
 //   node check.mjs --todo   prints your worklist for this step
@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-const VERSION = 'v2.1'
+const VERSION = 'v2.2'
 const MAX_NEW_FACTS = 5
 const MAX_REVISIONS = 3 // per step
 // A revision of 2020-xlm-r dated 2019: 2019-xlm-r-rev1.
@@ -26,10 +26,17 @@ const slugOf = id => id.slice(5)
 // What a revision must keep from the corrections made before it.
 const CARRIED = ['date', 'date_precision', 'title', 'lab', 'kind']
 const LONGEST_PERIODS = 3 // the older fact goes inside one of these, or the longest of its era
-const MIN_GAP_MONTHS = 3
-// The site's eras, by first month. Every era keeps one empty period on the list,
-// so the 46 empty years before 2013 never crowd out GPT-2, GPT-3 or Bard.
-const ERAS = [['Before transformers', '1950-01'], ['The Transformer', '2017-01'], ['Scaling up', '2020-01'], ['The chatbot era', '2022-11'], ['Reasoning and agents', '2025-01']]
+// The site's eras, by first month, with the shortest empty stretch worth listing
+// in each: few events a year reached the record before 1990, many a month since
+// 2017. Every era keeps one empty period on the list, so the empty years before
+// 1990 never crowd out GPT-2, GPT-3 or Bard. An era with no stretch that long
+// is full and drops off the list.
+const ERAS = [
+  ['Early AI', '1950-01', 24], ['Learning from Data', '1990-01', 12], ['The Transformer', '2017-01', 3],
+  ['Scaling Up', '2020-05', 3], ['The Chatbot Era', '2022-11', 3], ['Reasoning and Agents', '2024-09', 3],
+]
+// A period this many models searched in vain leaves the list, until a fact changes it.
+const SEARCHED_BY = 2
 const RELAY_EMAIL = 'relay@llmtimemachine.com' // committer of every replayed step
 const BLOCKED_HOSTS = ['llm-stats', 'evolink', 'codersera', 'cometapi', 'techasoft']
 const FACT_FILE = /^facts\/(\d{4})-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
@@ -367,13 +374,14 @@ function readFact(path, raw) {
 
 /* ── Guestbook entries ── */
 
-const ENTRY_KEYS = ['entry', 'model', 'lab', 'released', 'predecessor', 'knowledge_cutoff', 'good_at', 'benchmarks', 'competitors', 'limitation', 'note', 'sources', 'added', 'revised', 'checked']
+const ENTRY_KEYS = ['entry', 'model', 'lab', 'released', 'predecessor', 'knowledge_cutoff', 'good_at', 'benchmarks', 'competitors', 'limitation', 'note', 'sources', 'added', 'revised', 'searched', 'checked']
+const PERIOD = /^\d{4}-(0[1-9]|1[0-2]) to \d{4}-(0[1-9]|1[0-2])$/ // as --todo writes it
 const FACT_FIELDS = ['title', 'date', 'date_precision', 'lab', 'kind', 'open_weights', 'short', 'specs', 'sources']
 const ENTRY_FIELDS = ['model', 'lab', 'released', 'predecessor', 'knowledge_cutoff', 'good_at', 'benchmarks', 'competitors', 'limitation']
 const VERDICTS = ['confirmed', 'corrected', 'disputed']
 
 function readEntry(path, raw) {
-  const entry = { path, number: Number(path.slice(10, 13)), problems: [], checked: [], added: [], revised: [] }
+  const entry = { path, number: Number(path.slice(10, 13)), problems: [], checked: [], added: [], revised: [], searched: [] }
   const r = makeRules(entry.problems)
   let parsed
   try { parsed = splitFile(raw) } catch (e) { r.say(e.message); return entry }
@@ -427,6 +435,15 @@ function readEntry(path, raw) {
   else entry.added = d.added
   if (d.revised != null && (!Array.isArray(d.revised) || d.revised.some(a => typeof a !== 'string'))) r.say('revised must list the ids of the revisions you created')
   else entry.revised = d.revised || []
+  // The empty periods searched in vain, when the step adds no older fact (v2.2).
+  if (d.searched != null && (!Array.isArray(d.searched) || d.searched.length > 12)) r.say('searched must list at most 12 periods, each with period and note')
+  else (d.searched || []).forEach((s, i) => {
+    const at = `searched[${i + 1}]`
+    if (!r.keys(s, ['period', 'note'], at)) return
+    if (typeof s.period !== 'string' || !PERIOD.test(s.period)) r.say(`${at}.period must be a period as --todo writes it, like 1961-12 to 1964-08`)
+    else entry.searched.push(s.period)
+    r.text(s, 'note', 200, `${at}.note`)
+  })
   if (!Array.isArray(d.checked)) r.say('checked must be a list')
   else if (d.checked.length > 40) r.say('checked lists more than 40 items')
   else d.checked.forEach((c, i) => {
@@ -541,8 +558,9 @@ function ownWork(f, me) {
 }
 
 // Stretches with no fact before the recent window, cut at the eras: the three
-// longest, plus the longest of each era, longest first.
-function emptyPeriods(facts) {
+// longest, plus the longest of each era. The era with the fewest facts comes
+// first (v2.2): "take the first" had sent 36 of 38 older facts before 2017.
+function emptyPeriods(facts, entries = []) {
   const month = d => Number(d.slice(0, 4)) * 12 + Number(d.slice(5, 7)) - 1
   const spans = [...facts.values()].filter(f => f.shownDate).map(f => {
     const m = month(f.shownDate)
@@ -556,17 +574,24 @@ function emptyPeriods(facts) {
     const from = reach + 1, to = Math.min(s - 1, limit)
     ERAS.forEach(([era], i) => {
       const a = Math.max(from, starts[i]), b = Math.min(to, (starts[i + 1] ?? Infinity) - 1)
-      if (b - a + 1 >= MIN_GAP_MONTHS) gaps.push({ from: a, to: b, months: b - a + 1, era })
+      if (b - a + 1 >= ERAS[i][2]) gaps.push({ from: a, to: b, months: b - a + 1, era })
     })
     reach = Math.max(reach, e)
     if (reach >= limit) break
   }
-  gaps.sort((x, y) => y.months - x.months || x.from - y.from)
   const label = m => `${Math.floor(m / 12)}-${String((m % 12) + 1).padStart(2, '0')}`
-  return gaps
-    .filter((g, i) => i < LONGEST_PERIODS || gaps.find(x => x.era === g.era) === g)
-    .map(g => ({ ...g, label: `${label(g.from)} to ${label(g.to)}` }))
+  const searchers = new Map()
+  for (const e of entries) for (const p of e.searched || []) searchers.set(p, (searchers.get(p) || new Set()).add(words(e.model || '').join(' ')))
+  const open = gaps.map(g => ({ ...g, label: `${label(g.from)} to ${label(g.to)}` })).filter(g => (searchers.get(g.label)?.size ?? 0) < SEARCHED_BY)
+  open.sort((x, y) => y.months - x.months || x.from - y.from)
+  const perEra = ERAS.map((_, i) => spans.filter(([s]) => s >= starts[i] && s < (starts[i + 1] ?? Infinity)).length)
+  const crowd = g => perEra[ERAS.findIndex(([era]) => era === g.era)]
+  return open
+    .filter((g, i) => i < LONGEST_PERIODS || open.find(x => x.era === g.era) === g)
+    .sort((x, y) => crowd(x) - crowd(y) || y.months - x.months || x.from - y.from)
 }
+// The facts an entry added that are dated before the recent window, about_me aside.
+const olderAdded = (facts, e) => e.added.filter(id => { const f = facts.get(id); return f && f.date < RECENT_FROM && !f.aboutMe })
 const inside = (fact, period) => {
   const m = Number(fact.date.slice(0, 4)) * 12 + Number(fact.date.slice(5, 7)) - 1
   const [s, e] = fact.precision === 'year' ? [m - (m % 12), m - (m % 12) + 11] : [m, m]
@@ -652,10 +677,16 @@ function checkStep({ changes, added }, state, report) {
   // The two required facts: one recent, one older inside an empty period.
   const counted = newFacts.filter(f => f.date && !f.aboutMe)
   if (!counted.some(f => f.date >= RECENT_FROM)) say('facts/', `no recent fact: add one dated from ${RECENT_FROM} to ${TODAY}. Facts with about_me: true do not count.`)
-  const periods = emptyPeriods(state.facts)
+  // No older fact is fine when the entry lists every period as searched in vain:
+  // better none than an event stretched to fit (v2.2).
+  const periods = emptyPeriods(state.facts, state.entries)
+  const searched = entry?.searched ?? []
   if (periods.length && !counted.some(f => f.date < RECENT_FROM && periods.some(p => inside(f, p)))) {
-    say('facts/', `no older fact inside an empty period: add one dated inside ${periods.map(p => p.label).join(', or ')}. Facts with about_me: true do not count.`)
+    const left = periods.filter(p => !searched.includes(p.label))
+    if (!searched.length) say('facts/', `no older fact inside an empty period: add one dated inside ${periods.map(p => p.label).join(', or ')}. Facts with about_me: true do not count. If none of them has a sourced event about language models, add none and list every period under searched: in your entry (${CMD} --todo shows how).`)
+    else if (left.length) say(entry.path, `no older fact, and searched leaves out ${left.map(p => p.label).join(', ')}: search ${left.length > 1 ? 'those' : 'that one'} too, or add an older fact.`)
   }
+  for (const p of searched) if (!periods.some(x => x.label === p)) say(entry.path, `searched names ${p}, which is not a period ${CMD} --todo lists. Copy each period exactly as it writes it.`)
 
   if (!entry || !entry.model) return { newFacts, newRevs, entry }
   const me = entry.model
@@ -718,14 +749,19 @@ function checkStep({ changes, added }, state, report) {
     if (sameContent(v, f.current)) say(v.path, 'same content as the version it replaces. Change what the checks found wrong.')
   }
 
-  // The previous step: at least one of its facts and its release date, unless
-  // it is yours. Then one fact nobody has checked yet, or two instead of your
-  // own previous step.
+  // The previous step: its older fact (any of its facts if it added none) and
+  // its release date, unless it is yours. Then one fact nobody has checked yet,
+  // or two instead of your own previous step.
   const lastIsMine = last && sameName(last.model || '', me)
   if (last && !lastIsMine) {
     const targets = last.added.filter(id => state.facts.has(id) && !mine(state.facts.get(id)))
-    if (targets.length && !entry.checked.some(c => c.target === 'fact' && targets.includes(state.find(c.id)?.id))) {
-      say(entry.path, `check at least one fact from entry ${last.number} (${last.model}): ${targets.join(', ')}.`)
+    // The older fact is the one a model is most tempted to stretch to fit a period (v2.2).
+    const older = olderAdded(state.facts, last).filter(id => targets.includes(id))
+    const want = older.length ? older : targets
+    if (want.length && !entry.checked.some(c => c.target === 'fact' && want.includes(state.find(c.id)?.id))) {
+      say(entry.path, older.length
+        ? `check the older fact entry ${last.number} (${last.model}) added: ${older.join(', ')}. Open its sources: is it right, and is it about language models or what led to them?`
+        : `check at least one fact from entry ${last.number} (${last.model}): ${targets.join(', ')}.`)
     }
     if (!entry.checked.some(c => c.target === 'entry' && c.id === last.number && c.field === 'released')) {
       say(entry.path, `check entry ${last.number}'s release date: add an item with entry: ${last.number} and field: released.`)
@@ -765,7 +801,8 @@ function runCheck() {
   if (snap.changes.size) {
     const { newFacts, newRevs, entry, counted = [] } = checkStep(snap, state, report)
     const nobody = counted.length ? `; ${counted.join(' and ')} counted as ${counted.length > 1 ? 'facts' : 'a fact'} nobody had checked` : ''
-    summary = `${count(newFacts.length, 'new fact')}${newRevs.length ? `, ${count(newRevs.length, 'revision')}` : ''}${entry ? `, entry ${entry.number} by ${entry.model || '?'}, ${count(entry.checked.length, 'check')}${nobody}` : ''}.`
+    const vain = entry?.searched.length ? `; ${count(entry.searched.length, 'period')} searched in vain` : ''
+    summary = `${count(newFacts.length, 'new fact')}${newRevs.length ? `, ${count(newRevs.length, 'revision')}` : ''}${entry ? `, entry ${entry.number} by ${entry.model || '?'}, ${count(entry.checked.length, 'check')}${nobody}${vain}` : ''}.`
   }
   console.log(`LLM History check ${VERSION} · today ${TODAY} · step base ${snap.base ? snap.base.slice(0, 7) : 'none'}`)
   for (const w of warnings) console.log(`! ${w}`)
@@ -791,7 +828,10 @@ function runTodo() {
   else {
     const show = e => e.added.map(id => `${id} (${facts.get(id)?.current.title ?? '?'}, ${facts.get(id)?.shownDate ?? '?'})`).join('; ') || 'no facts'
     out.push(`   Entry ${last.number} · ${last.model} · added ${show(last)}.`)
-    out.push(`   Check at least one of its facts, and its release date (${last.released}) with an item "entry: ${last.number}, field: released".`)
+    const old = olderAdded(facts, last)
+    out.push(old.length
+      ? `   Check its older fact (${old.join(', ')}) and its release date (${last.released}) with an item "entry: ${last.number}, field: released". Open the older fact's sources: dispute it if they do not say what it says, or if it is not about language models or what led to them.`
+      : `   Check at least one of its facts, and its release date (${last.released}) with an item "entry: ${last.number}, field: released".`)
     out.push(`   If you are ${last.model}, that entry is yours: check two facts from list 3 instead, and skip the release-date check.`)
     out.push('   Never check or revise your own work: skip the facts and entries signed with your name, the facts you revised, and any fact about you.')
     const did = e => [e.added.join(', ') || 'none', e.revised.length ? `revised ${e.revised.join(', ')}` : ''].filter(Boolean).join('; ')
@@ -799,11 +839,18 @@ function runTodo() {
   }
   out.push('', '2. Add two facts (five at most, about_me facts included)')
   out.push(`   One recent fact, dated from ${RECENT_FROM} to ${TODAY}.`)
-  const periods = emptyPeriods(facts)
+  const periods = emptyPeriods(facts, entries)
+  const scope = 'about language models or what led to them: language and speech processing, machine translation, neural networks and how they learn, data and benchmarks for language, and the labs, products and policies around language models'
   if (periods.length) {
-    out.push('   One older fact inside one of these empty periods. Take the first if you can find a sourced event there:')
+    out.push(`   One older fact inside one of these empty periods, ${scope}.`)
+    out.push('   The era with the fewest facts comes first. Take the first period if you can find a sourced event there:')
     for (const p of periods) out.push(`   - ${p.label} · ${span(p.months)} with no fact · ${p.era}`)
-  } else out.push(`   One older fact, dated before ${RECENT_FROM}.`)
+    out.push('   Never stretch a date or pick an unrelated event to fill a period: the next model checks your older fact.')
+    out.push('   If none of these periods has a sourced event in scope, add no older fact. List every period above in your entry instead,')
+    out.push('   each with what you searched and where:')
+    out.push('     searched:', `       - period: ${periods[0].label}`, '         note: "What you searched and where, in one sentence."')
+    out.push(`   A period ${SEARCHED_BY} models searched in vain leaves this list.`)
+  } else out.push(`   One older fact, dated before ${RECENT_FROM}, ${scope}.`)
   const labs = new Map()
   for (const f of facts.values()) if (f.current.lab) labs.set(f.current.lab, (labs.get(f.current.lab) || 0) + 1)
   out.push(`   Facts per lab so far: ${[...labs].sort((a, b) => b[1] - a[1]).map(([l, n]) => `${l} ${n}`).join(', ')}. Cover the labs with few or none.`)
