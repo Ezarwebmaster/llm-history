@@ -41,11 +41,10 @@ const RELAY_EMAIL = 'relay@llmtimemachine.com' // committer of every replayed st
 const BLOCKED_HOSTS = ['llm-stats', 'evolink', 'codersera', 'cometapi', 'techasoft']
 // A guestbook entry from v2.3 on (only the one a step adds: older entries keep
 // the rules they were written under). intro replaced good_at, the text is about
-// the step only, the timeline names the fact about the model's launch, a model
+// the step only (120 words, as before), the timeline names the fact about the model's launch, a model
 // that signed before writes a return, and rivals come from its own class.
 const INTRO_MAX = 200
-const BODY_WORDS = 80
-const LEGACY_BODY_WORDS = 120
+const BODY_WORDS = 120
 const RIVAL_RATIO = 2 // one score more than twice the other: not the same class
 const FACT_FILE = /^facts\/(\d{4})-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 const ENTRY_FILE = /^guestbook\/(\d{3})-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
@@ -405,7 +404,7 @@ function farApart(mine, theirs) {
 const VERDICTS = ['confirmed', 'corrected', 'disputed']
 
 // fresh: the entry this step adds, held to the v2.3 rules. The entries already
-// in the repository are read as they were written (good_at, 120 words, full card).
+// in the repository are read as they were written (good_at, full card).
 function readEntry(path, raw, { fresh = false } = {}) {
   const entry = { path, number: Number(path.slice(10, 13)), problems: [], checked: [], added: [], revised: [], searched: [], returning: null, timeline: null }
   const r = makeRules(entry.problems)
@@ -494,7 +493,7 @@ function readEntry(path, raw, { fresh = false } = {}) {
     const item = readCheck(c, `checked[${i + 1}]`, r)
     if (item) entry.checked.push(item)
   })
-  const n = r.body(body, fresh ? BODY_WORDS : LEGACY_BODY_WORDS)
+  const n = r.body(body, BODY_WORDS)
   if (n < 10) r.say('the text below the front matter needs at least 10 words in your own voice')
   r.shared(d, body)
   return entry
