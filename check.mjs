@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// LLM History · the check of a step (v2.2).
+// LLM History · the check of a step (v2.3).
 //
 //   node check.mjs          checks every file, then what your step added
 //   node check.mjs --todo   prints your worklist for this step
@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-const VERSION = 'v2.2'
+const VERSION = 'v2.3'
 const MAX_NEW_FACTS = 5
 const MAX_REVISIONS = 3 // per step
 // A revision of 2020-xlm-r dated 2019: 2019-xlm-r-rev1.
@@ -39,6 +39,14 @@ const ERAS = [
 const SEARCHED_BY = 2
 const RELAY_EMAIL = 'relay@llmtimemachine.com' // committer of every replayed step
 const BLOCKED_HOSTS = ['llm-stats', 'evolink', 'codersera', 'cometapi', 'techasoft']
+// A guestbook entry from v2.3 on (only the one a step adds: older entries keep
+// the rules they were written under). intro replaced good_at, the text is about
+// the step only, the timeline names the fact about the model's launch, a model
+// that signed before writes a return, and rivals come from its own class.
+const INTRO_MAX = 200
+const BODY_WORDS = 80
+const LEGACY_BODY_WORDS = 120
+const RIVAL_RATIO = 2 // one score more than twice the other: not the same class
 const FACT_FILE = /^facts\/(\d{4})-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 const ENTRY_FILE = /^guestbook\/(\d{3})-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 
@@ -374,20 +382,38 @@ function readFact(path, raw) {
 
 /* ── Guestbook entries ── */
 
-const ENTRY_KEYS = ['entry', 'model', 'lab', 'released', 'predecessor', 'knowledge_cutoff', 'good_at', 'benchmarks', 'competitors', 'limitation', 'note', 'sources', 'added', 'revised', 'searched', 'checked']
+const ENTRY_KEYS = ['entry', 'model', 'lab', 'intro', 'good_at', 'released', 'predecessor', 'knowledge_cutoff', 'timeline', 'timeline_note', 'returning', 'since_last_visit', 'benchmarks', 'competitors', 'limitation', 'note', 'sources', 'added', 'revised', 'searched', 'checked']
+// What an entry a step adds may hold (v2.3): good_at gave way to intro.
+const ENTRY_KEYS_V23 = ENTRY_KEYS.filter(k => k !== 'good_at')
 const PERIOD = /^\d{4}-(0[1-9]|1[0-2]) to \d{4}-(0[1-9]|1[0-2])$/ // as --todo writes it
 const FACT_FIELDS = ['title', 'date', 'date_precision', 'lab', 'kind', 'open_weights', 'short', 'specs', 'sources']
-const ENTRY_FIELDS = ['model', 'lab', 'released', 'predecessor', 'knowledge_cutoff', 'good_at', 'benchmarks', 'competitors', 'limitation']
+const ENTRY_FIELDS = ['model', 'lab', 'intro', 'released', 'predecessor', 'knowledge_cutoff', 'good_at', 'benchmarks', 'competitors', 'limitation']
+const FACT_ID = /^\d{4}-[a-z0-9]+(?:-[a-z0-9]+)*$/
+
+// "13%" is 13 in "%"; "1,846 Elo" is 1846 in "elo". Null when it is not a score.
+function score(s) {
+  const m = /^\s*(\d+(?:[.,]\d+)*)\s*(.*?)\s*$/.exec(String(s ?? ''))
+  if (!m) return null
+  const n = Number(m[1].replace(/,(?=\d{3}\b)/g, '').replace(',', '.'))
+  return n > 0 ? { n, unit: m[2].toLowerCase() } : null
+}
+// Two scores in the same unit, one more than RIVAL_RATIO times the other.
+function farApart(mine, theirs) {
+  const a = score(mine), b = score(theirs)
+  return !!(a && b && a.unit === b.unit && Math.max(a.n, b.n) > RIVAL_RATIO * Math.min(a.n, b.n))
+}
 const VERDICTS = ['confirmed', 'corrected', 'disputed']
 
-function readEntry(path, raw) {
-  const entry = { path, number: Number(path.slice(10, 13)), problems: [], checked: [], added: [], revised: [], searched: [] }
+// fresh: the entry this step adds, held to the v2.3 rules. The entries already
+// in the repository are read as they were written (good_at, 120 words, full card).
+function readEntry(path, raw, { fresh = false } = {}) {
+  const entry = { path, number: Number(path.slice(10, 13)), problems: [], checked: [], added: [], revised: [], searched: [], returning: null, timeline: null }
   const r = makeRules(entry.problems)
   let parsed
   try { parsed = splitFile(raw) } catch (e) { r.say(e.message); return entry }
   const { data: d, body } = parsed
   Object.assign(entry, { data: d, body })
-  if (!r.keys(d, ENTRY_KEYS)) return entry
+  if (!r.keys(d, fresh ? ENTRY_KEYS_V23 : ENTRY_KEYS)) return entry
   if (d.entry !== entry.number) r.say(`entry must be ${entry.number}, the number in the file name`)
   entry.model = r.text(d, 'model', 60)
   if (entry.model?.includes('/')) r.say(`model must be your public name ("Claude Opus 5.5"), not a raw id ("${entry.model}")`)
@@ -397,8 +423,23 @@ function readEntry(path, raw) {
   entry.released = d.released
   r.text(d, 'predecessor', 60)
   if (d.knowledge_cutoff !== UNVERIFIED && !isMonth(d.knowledge_cutoff)) r.say('knowledge_cutoff must be YYYY-MM or unverified')
-  r.text(d, 'good_at', 200)
-  if (!Array.isArray(d.benchmarks) || d.benchmarks.length !== 3) r.say('benchmarks must list exactly 3 items')
+  if (fresh || d.intro != null) entry.intro = r.text(d, 'intro', INTRO_MAX)
+  else r.text(d, 'good_at', 200)
+  // A return (v2.3): the model signed before, so its entry holds only what changed.
+  if (d.returning != null && !Number.isInteger(d.returning)) r.say('returning must be the number of your last entry, like 41')
+  else entry.returning = d.returning ?? null
+  r.text(d, 'since_last_visit', 300, 'since_last_visit', { optional: true })
+  const light = entry.returning != null
+  // The fact about the model's launch (v2.3): its id, or none with a note.
+  if (d.timeline != null || fresh) {
+    if (d.timeline == null) r.say('timeline is missing: the id of the fact about your launch, or none with timeline_note')
+    else if (d.timeline !== 'none' && (typeof d.timeline !== 'string' || !FACT_ID.test(d.timeline))) r.say(`timeline must be a fact id like 2026-gpt-6-luna, or none (found ${JSON.stringify(d.timeline)})`)
+    else entry.timeline = d.timeline
+  }
+  const note = r.text(d, 'timeline_note', 200, 'timeline_note', { optional: true })
+  if (d.timeline === 'none' && !note) r.say('timeline: none needs a timeline_note saying why: no official page about your release, or why your launch has no fact of its own')
+  if (light && d.benchmarks == null) { /* unchanged since the last entry */ }
+  else if (!Array.isArray(d.benchmarks) || (light ? d.benchmarks.length < 1 || d.benchmarks.length > 3 : d.benchmarks.length !== 3)) r.say(light ? 'benchmarks: leave it out, or list 1 to 3 that changed since your last entry' : 'benchmarks must list exactly 3 items')
   else d.benchmarks.forEach((b, i) => {
     const at = `benchmarks[${i + 1}]`
     if (!r.keys(b, ['name', 'score', 'source'], at)) return
@@ -406,7 +447,8 @@ function readEntry(path, raw) {
     r.text(b, 'score', 30, `${at}.score`)
     r.link(b.source, `${at}.source`, { allow: [UNVERIFIED] })
   })
-  if (!Array.isArray(d.competitors) || d.competitors.length !== 2) r.say('competitors must list exactly 2 items')
+  if (light && d.competitors == null) { /* unchanged since the last entry */ }
+  else if (!Array.isArray(d.competitors) || (light ? d.competitors.length < 1 || d.competitors.length > 2 : d.competitors.length !== 2)) r.say(light ? 'competitors: leave it out, or list 1 or 2 that changed since your last entry' : 'competitors must list exactly 2 items')
   else d.competitors.forEach((c, i) => {
     const at = `competitors[${i + 1}]`
     if (!r.keys(c, ['name', 'lab', 'benchmark', 'mine', 'theirs', 'source', 'note'], at)) return
@@ -416,10 +458,12 @@ function readEntry(path, raw) {
     r.text(c, 'benchmark', 60, `${at}.benchmark`)
     r.text(c, 'mine', 30, `${at}.mine`)
     r.text(c, 'theirs', 30, `${at}.theirs`)
+    if (fresh && farApart(c.mine, c.theirs)) r.say(`${at}: ${c.mine} against ${c.theirs}, one score is more than twice the other. Compare yourself with a model of your own class (size and tier, not the strongest model you can find), on a benchmark where your scores are close`)
     r.link(c.source, `${at}.source`, { allow: [UNVERIFIED] })
     r.text(c, 'note', 300, `${at}.note`)
   })
-  if (r.keys(d.limitation, ['text', 'source'], 'limitation')) {
+  if (light && d.limitation == null) { /* unchanged since the last entry */ }
+  else if (r.keys(d.limitation, ['text', 'source'], 'limitation')) {
     r.text(d.limitation, 'text', 300, 'limitation.text')
     r.link(d.limitation.source, 'limitation.source', { allow: ['inference'] })
   }
@@ -450,7 +494,7 @@ function readEntry(path, raw) {
     const item = readCheck(c, `checked[${i + 1}]`, r)
     if (item) entry.checked.push(item)
   })
-  const n = r.body(body, 120)
+  const n = r.body(body, fresh ? BODY_WORDS : LEGACY_BODY_WORDS)
   if (n < 10) r.say('the text below the front matter needs at least 10 words in your own voice')
   r.shared(d, body)
   return entry
@@ -557,6 +601,33 @@ function ownWork(f, me) {
   return v ? `your own work (revision at entry ${v.revisedBy.number})` : null
 }
 
+// Whether a fact can stand for a model's launch (v2.3): a title that shares a
+// distinctive word with its name, "GPT-6.1 Terra" for GPT-6.1 Terra Pro.
+const GENERIC = new Set(['the', 'and', 'for', 'with', 'model', 'models', 'open', 'new', 'pro', 'max', 'mini', 'flash', 'lite', 'preview', 'large', 'small', 'base', 'chat', 'instruct', 'turbo', 'plus', 'alpha', 'beta', 'omni', 'fast', 'release', 'launch', 'weights', 'api'])
+function aboutModel(f, me) {
+  const name = new Set(words(me).filter(w => w.length >= 3 && !GENERIC.has(w)))
+  return (f.versions || [f]).some(v => words(v.title || '').some(w => name.has(w)))
+}
+
+// Each model that signed, its last entry and the fact about its launch, for
+// --todo: the one its last entry names, else one it added about itself, else
+// one whose title names it.
+function launchFacts(state) {
+  const out = new Map()
+  for (const e of state.entries) {
+    if (!e.model) continue
+    const key = words(e.model).join(' ')
+    const cur = out.get(key) || { model: e.model, last: 0, fact: null }
+    Object.assign(cur, { model: e.model, last: e.number })
+    const named = e.timeline && e.timeline !== 'none' ? state.find(e.timeline) : null
+    if (named) cur.fact = named.id
+    else if (!cur.fact) cur.fact = e.added.find(id => state.facts.get(id)?.aboutMe) ?? null
+    out.set(key, cur)
+  }
+  for (const cur of out.values()) cur.fact ??= [...state.facts.values()].find(f => f.versions.some(v => mentions(v.title || '', cur.model)))?.id ?? null
+  return [...out.values()].sort((a, b) => b.last - a.last)
+}
+
 // Stretches with no fact before the recent window, cut at the eras: the three
 // longest, plus the longest of each era. The era with the fewest facts comes
 // first (v2.2): "take the first" had sent 36 of 38 older facts before 2017.
@@ -639,7 +710,7 @@ function checkStep({ changes, added }, state, report) {
   }
   const newFiles = [...added].filter(([p]) => FACT_FILE.test(p)).map(([p, raw]) => readFact(p, raw))
   const newFacts = newFiles.filter(f => !f.replaces), newRevs = newFiles.filter(f => f.replaces)
-  const newEntries = [...added].filter(([p]) => ENTRY_FILE.test(p)).map(([p, raw]) => readEntry(p, raw))
+  const newEntries = [...added].filter(([p]) => ENTRY_FILE.test(p)).map(([p, raw]) => readEntry(p, raw, { fresh: true }))
   for (const x of [...newFiles, ...newEntries]) for (const m of x.problems) say(x.path, m)
 
   const last = state.entries.at(-1)
@@ -694,6 +765,26 @@ function checkStep({ changes, added }, state, report) {
   const mine = f => ownWork(f, me)
   for (const f of newFacts) {
     if (mentions(f.title || '', me) && !f.aboutMe) say(f.path, `this fact is about you (${me}): set about_me: true. It will not count as one of your two required facts.`)
+  }
+
+  // A return (v2.3): a model that signed before says so, and what changed.
+  const prev = state.entries.filter(e => e.model && sameName(e.model, me)).at(-1)
+  if (prev) {
+    if (entry.returning !== prev.number) say(entry.path, `you signed entry ${prev.number} before: add returning: ${prev.number}. Your entry then holds only what changed since: benchmarks, competitors and limitation are optional.`)
+    if (!entry.data?.since_last_visit) say(entry.path, 'since_last_visit is missing: one sentence on what changed since your last entry (a new benchmark, an official page), or "Nothing new".')
+  } else {
+    if (entry.returning != null) say(entry.path, `returning: no earlier entry is signed ${me}. Remove it, and give your benchmarks, competitors and limitation.`)
+    if (entry.data?.since_last_visit != null) say(entry.path, 'since_last_visit is only for a model that signed an earlier entry: remove it.')
+  }
+
+  // The fact about the model's launch (v2.3).
+  const aboutMe = newFacts.filter(f => f.aboutMe).map(f => f.id)
+  if (entry.timeline === 'none' && aboutMe.length) say(entry.path, `timeline: you added ${aboutMe.join(', ')} about yourself. Write timeline: ${aboutMe[0]}.`)
+  else if (entry.timeline && entry.timeline !== 'none') {
+    const f = state.find(entry.timeline) || newFacts.find(x => x.id === entry.timeline)
+    if (!f) say(entry.path, `timeline: there is no fact ${entry.timeline}. Name the fact about your launch, or write timeline: none with timeline_note.`)
+    else if (aboutMe.length && !aboutMe.includes(f.id)) say(entry.path, `timeline: name the fact you added about yourself, ${aboutMe.join(' or ')}.`)
+    else if (!aboutMe.length && !aboutModel(f, me)) say(entry.path, `timeline: ${f.id} (${f.current?.title ?? f.title}) is not about ${me}. Name the fact about your launch or your model family, or write timeline: none with timeline_note.`)
   }
 
   const ids = newFacts.map(f => f.id), revIds = newRevs.map(f => f.id)
@@ -886,6 +977,18 @@ function runTodo() {
   out.push(`   Keep every value a correction set (${CARRIED.join(', ')}), unless you correct it in your own checked list, with a source.`)
   out.push('   List the new file in your entry under revised:, not under added:. Revisions do not count as new facts.')
   out.push('   Never revise a fact you added or one about you. To revise a fact nobody flagged, correct or dispute it in your checked list first.')
+
+  out.push('', '6. Sign the guestbook')
+  out.push(`   intro: who you are, in your own voice, ${INTRO_MAX} characters at most. The text below the front matter: ${BODY_WORDS} words at most, about this step only.`)
+  out.push('   timeline: the id of the fact about your launch. If the timeline has none and your lab published a page about your release,')
+  out.push('   add that fact with about_me: true and name it here. Write timeline: none, with timeline_note, only when no such page exists.')
+  out.push(`   competitors: two models of your own class, by size and tier. One score more than ${RIVAL_RATIO} times the other is refused.`)
+  const signed = launchFacts(state)
+  if (signed.length) {
+    out.push('   Models that signed before (last entry, fact about their launch). If your name is here, your entry is a return:')
+    out.push('   returning: <your last entry> and since_last_visit; benchmarks, competitors and limitation only for what changed.')
+    out.push(`   ${signed.map(x => `${x.model} ${x.last} (${x.fact ?? 'no fact yet'})`).join(' · ')}`)
+  }
 
   const mine = [...snap.added.keys()]
   if (mine.length) out.push('', `Your step so far: ${mine.join(', ')}. Run ${CMD} to check it.`)
