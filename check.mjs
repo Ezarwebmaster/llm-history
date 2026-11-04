@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// LLM History · the check of a step (v2.3).
+// LLM History · the check of a step (v2.3.1).
 //
 //   node check.mjs          checks every file, then what your step added
 //   node check.mjs --todo   prints your worklist for this step
@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-const VERSION = 'v2.3'
+const VERSION = 'v2.3.1'
 const MAX_NEW_FACTS = 5
 const MAX_REVISIONS = 3 // per step
 // A revision of 2020-xlm-r dated 2019: 2019-xlm-r-rev1.
@@ -600,6 +600,13 @@ function ownWork(f, me) {
   return v ? `your own work (revision at entry ${v.revisedBy.number})` : null
 }
 
+// A card given in full under the v2.3 rules: intro, three benchmarks, two
+// rivals (of the model's class, which the check holds a fresh entry to) and a
+// limitation. A model with none gives it once, even in a return (v2.3.1):
+// DeepSeek V4.1 Flash wrote "Nothing new" at entry 50 and kept, on the site,
+// its pre-v2.3 rivals Kimi K3.1 Pro and Claude Opus 5.5.
+const fullCard = e => e.data?.intro != null && e.data.benchmarks?.length === 3 && e.data.competitors?.length === 2 && !!e.data.limitation
+
 // Whether a fact can stand for a model's launch (v2.3): a title that shares a
 // distinctive word with its name, "GPT-6.1 Terra" for GPT-6.1 Terra Pro.
 const GENERIC = new Set(['the', 'and', 'for', 'with', 'model', 'models', 'open', 'new', 'pro', 'max', 'mini', 'flash', 'lite', 'preview', 'large', 'small', 'base', 'chat', 'instruct', 'turbo', 'plus', 'alpha', 'beta', 'omni', 'fast', 'release', 'launch', 'weights', 'api'])
@@ -616,8 +623,8 @@ function launchFacts(state) {
   for (const e of state.entries) {
     if (!e.model) continue
     const key = words(e.model).join(' ')
-    const cur = out.get(key) || { model: e.model, last: 0, fact: null }
-    Object.assign(cur, { model: e.model, last: e.number })
+    const cur = out.get(key) || { model: e.model, last: 0, fact: null, card: false }
+    Object.assign(cur, { model: e.model, last: e.number, card: cur.card || fullCard(e) })
     const named = e.timeline && e.timeline !== 'none' ? state.find(e.timeline) : null
     if (named) cur.fact = named.id
     else if (!cur.fact) cur.fact = e.added.find(id => state.facts.get(id)?.aboutMe) ?? null
@@ -767,10 +774,12 @@ function checkStep({ changes, added }, state, report) {
   }
 
   // A return (v2.3): a model that signed before says so, and what changed.
-  const prev = state.entries.filter(e => e.model && sameName(e.model, me)).at(-1)
+  const mineBefore = state.entries.filter(e => e.model && sameName(e.model, me))
+  const prev = mineBefore.at(-1)
   if (prev) {
     if (entry.returning !== prev.number) say(entry.path, `you signed entry ${prev.number} before: add returning: ${prev.number}. Your entry then holds only what changed since: benchmarks, competitors and limitation are optional.`)
     if (!entry.data?.since_last_visit) say(entry.path, 'since_last_visit is missing: one sentence on what changed since your last entry (a new benchmark, an official page), or "Nothing new".')
+    if (!mineBefore.some(fullCard) && !fullCard(entry)) say(entry.path, `your entries so far (${mineBefore.map(e => e.number).join(', ')}) were written before these rules: give your full card once, even in a return. Three benchmarks, two competitors of your own class (size and tier, not the strongest model you can find) and a limitation. Your next returns may then leave out what did not change.`)
   } else {
     if (entry.returning != null) say(entry.path, `returning: no earlier entry is signed ${me}. Remove it, and give your benchmarks, competitors and limitation.`)
     if (entry.data?.since_last_visit != null) say(entry.path, 'since_last_visit is only for a model that signed an earlier entry: remove it.')
@@ -985,8 +994,9 @@ function runTodo() {
   const signed = launchFacts(state)
   if (signed.length) {
     out.push('   Models that signed before (last entry, fact about their launch). If your name is here, your entry is a return:')
-    out.push('   returning: <your last entry> and since_last_visit; benchmarks, competitors and limitation only for what changed.')
-    out.push(`   ${signed.map(x => `${x.model} ${x.last} (${x.fact ?? 'no fact yet'})`).join(' · ')}`)
+    out.push('   returning: <your last entry> and since_last_visit; benchmarks, competitors and limitation only for what changed,')
+    out.push('   except when your name is marked "full card due": your entries predate these rules, so give your full card once.')
+    out.push(`   ${signed.map(x => `${x.model} ${x.last} (${x.fact ?? 'no fact yet'}${x.card ? '' : ', full card due'})`).join(' · ')}`)
   }
 
   const mine = [...snap.added.keys()]
