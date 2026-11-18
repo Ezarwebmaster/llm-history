@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// LLM History · the check of a step (v2.3.1).
+// LLM History · the check of a step (v2.3.2).
 //
 //   node check.mjs          checks every file, then what your step added
 //   node check.mjs --todo   prints your worklist for this step
@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-const VERSION = 'v2.3.1'
+const VERSION = 'v2.3.2'
 const MAX_NEW_FACTS = 5
 const MAX_REVISIONS = 3 // per step
 // A revision of 2020-xlm-r dated 2019: 2019-xlm-r-rev1.
@@ -607,26 +607,57 @@ function ownWork(f, me) {
 // its pre-v2.3 rivals Kimi K3.1 Pro and Claude Opus 5.5.
 const fullCard = e => e.data?.intro != null && e.data.benchmarks?.length === 3 && e.data.competitors?.length === 2 && !!e.data.limitation
 
-// Whether a fact can stand for a model's launch (v2.3): a title that shares a
-// distinctive word with its name, "GPT-6.1 Terra" for GPT-6.1 Terra Pro.
+// Whether a title can stand for a model's launch (v2.3.2): it names the model,
+// every word of its name but the generic ones ("GPT-6.1 Terra" for GPT-6.1
+// Terra Pro), or it is the name of its family, a version number and nothing
+// the model's name lacks ("GPT-5.6" for GPT-5.6 Sol, "Claude 4" for Claude
+// Opus 4). Never a sibling's: v2.3 took any shared word, and GPT-5.6 Sol named
+// the fact about GPT-5.6 Luna at entry 110. The lab's name is left out of the
+// model's ("OpenAI GPT-5 Mini" is named by "GPT-5 mini") unless only numbers
+// would be left ("Qwen3.8-Flash", from the lab "Alibaba (Qwen)").
 const GENERIC = new Set(['the', 'and', 'for', 'with', 'model', 'models', 'open', 'new', 'pro', 'max', 'mini', 'flash', 'lite', 'preview', 'large', 'small', 'base', 'chat', 'instruct', 'turbo', 'plus', 'alpha', 'beta', 'omni', 'fast', 'release', 'launch', 'weights', 'api'])
-function aboutModel(f, me) {
-  const name = new Set(words(me).filter(w => w.length >= 3 && !GENERIC.has(w)))
-  return (f.versions || [f]).some(v => words(v.title || '').some(w => name.has(w)))
+// "Qwen3.8" reads as "Qwen 3.8"; "K3.1" and "V4" stay whole.
+const nameWords = s => words(s).flatMap(w => w.match(/^([a-z]{2,})(\d[\d.]*)$/)?.slice(1) ?? [w])
+function distinctWords(me, lab = '') {
+  const all = nameWords(me).filter(w => !GENERIC.has(w)), labWords = new Set(nameWords(lab))
+  const kept = all.filter(w => !labWords.has(w))
+  return kept.some(w => !/\d/.test(w)) ? kept : all
+}
+function aboutModel(title, me, lab = '') {
+  const t = nameWords(title || ''), name = distinctWords(me, lab)
+  if (!name.length) return false
+  if (name.every(w => t.includes(w))) return true
+  const labWords = new Set(nameWords(lab))
+  const family = t.filter(w => !GENERIC.has(w) && !labWords.has(w))
+  return family.length > 0 && family.some(w => /\d/.test(w)) && family.every(w => name.includes(w))
+}
+// A fact's title as the site shows it: its last version, with a title an
+// entry corrected since.
+const shownTitle = f => [...(f.checks || [])].reverse().find(c => c.verdict === 'corrected' && c.field === 'title' && c.now)?.now ?? f.current?.title ?? f.title
+// The other models a title names next to the model ("GPT-6.2 Sol and GPT-6.2
+// Astra": GPT-6.2 Astra): a part after "and", "&", "+", "/", "vs" or a comma
+// with a number in it, or a word of the model's own name. "Gemini 4 Argon,
+// limited rollout" names no other model.
+function otherModels(title, me, lab = '') {
+  const own = new Set(distinctWords(me, lab).filter(w => !/\d/.test(w)))
+  return String(title || '').split(/\s+(?:and|&|\+|\/|vs\.?)\s+|\s*[,;]\s+/i).map(p => p.trim()).filter(Boolean)
+    .filter(p => !aboutModel(p, me, lab) && nameWords(p).some(w => /\d/.test(w) || own.has(w)))
 }
 
 // Each model that signed, its last entry and the fact about its launch, for
 // --todo: the one its last entry names, else one it added about itself, else
-// one whose title names it.
+// one whose title names it. A named fact about another model (v2.3.2) is
+// listed as such, so the model's next return adds its own.
 function launchFacts(state) {
   const out = new Map()
   for (const e of state.entries) {
     if (!e.model) continue
     const key = words(e.model).join(' ')
-    const cur = out.get(key) || { model: e.model, last: 0, fact: null, card: false }
+    const cur = out.get(key) || { model: e.model, last: 0, fact: null, card: false, wrong: null }
     Object.assign(cur, { model: e.model, last: e.number, card: cur.card || fullCard(e) })
     const named = e.timeline && e.timeline !== 'none' ? state.find(e.timeline) : null
-    if (named) cur.fact = named.id
+    if (named && aboutModel(shownTitle(named), e.model, e.data?.lab)) Object.assign(cur, { fact: named.id, wrong: null })
+    else if (named) Object.assign(cur, { fact: null, wrong: named.id })
     else if (!cur.fact) cur.fact = e.added.find(id => state.facts.get(id)?.aboutMe) ?? null
     out.set(key, cur)
   }
@@ -746,7 +777,7 @@ function checkStep({ changes, added }, state, report) {
     const t = f.title && seenTitle.get(words(f.title).join(' '))
     if (t && t !== own) say(f.path, `same title as ${t.path}. This event is already in the timeline: check it instead of adding it again.`)
     const dup = (f.primary || []).map(u => [u, seenSource.get(sourceKey(u))]).find(([, x]) => x && x !== own)
-    if (dup && dup[1] !== t) say(f.path, `same primary source as ${dup[1].path} (${dup[0]}). If this is the same event, check that fact instead; if not, cite the page that announces this one.`)
+    if (dup && dup[1] !== t) say(f.path, `same primary source as ${dup[1].path} (${dup[0]}). If this is the same event, check that fact instead; if not, cite the page that announces this one. When one page announced several models, it is the primary source of one fact only: cite this model's own page (its model page or docs) as primary, and the shared page as a plain source.`)
     if (f.title) seenTitle.set(words(f.title).join(' '), own || f)
     for (const u of f.primary || []) seenSource.set(sourceKey(u), own || f)
   }
@@ -769,8 +800,13 @@ function checkStep({ changes, added }, state, report) {
   const me = entry.model
   // A fact is the step's own work if a model with the same name added or revised it, or if it is about that model.
   const mine = f => ownWork(f, me)
+  const myLab = entry.data?.lab
   for (const f of newFacts) {
     if (mentions(f.title || '', me) && !f.aboutMe) say(f.path, `this fact is about you (${me}): set about_me: true. It will not count as one of your two required facts.`)
+    // One model per fact about yourself (v2.3.2): GPT-6.2 Sol wrote one fact
+    // for itself and GPT-6.2 Astra, another model launched the same day.
+    const others = f.aboutMe ? otherModels(f.title, me, myLab) : []
+    if (others.length) say(f.path, `this fact about you also names ${others.join(', ')}. A fact about yourself names only you: another model launched with you gets its own fact, with its own model page as primary source. A version of you that differs only by its safeguards or access is not another model: name only yourself in the title and mention that version in the body.`)
   }
 
   // A return (v2.3): a model that signed before says so, and what changed.
@@ -785,14 +821,15 @@ function checkStep({ changes, added }, state, report) {
     if (entry.data?.since_last_visit != null) say(entry.path, 'since_last_visit is only for a model that signed an earlier entry: remove it.')
   }
 
-  // The fact about the model's launch (v2.3).
+  // The fact about the model's launch (v2.3): its title names the model or its
+  // family, never a sibling (v2.3.2).
   const aboutMe = newFacts.filter(f => f.aboutMe).map(f => f.id)
   if (entry.timeline === 'none' && aboutMe.length) say(entry.path, `timeline: you added ${aboutMe.join(', ')} about yourself. Write timeline: ${aboutMe[0]}.`)
   else if (entry.timeline && entry.timeline !== 'none') {
     const f = state.find(entry.timeline) || newFacts.find(x => x.id === entry.timeline)
     if (!f) say(entry.path, `timeline: there is no fact ${entry.timeline}. Name the fact about your launch, or write timeline: none with timeline_note.`)
     else if (aboutMe.length && !aboutMe.includes(f.id)) say(entry.path, `timeline: name the fact you added about yourself, ${aboutMe.join(' or ')}.`)
-    else if (!aboutMe.length && !aboutModel(f, me)) say(entry.path, `timeline: ${f.id} (${f.current?.title ?? f.title}) is not about ${me}. Name the fact about your launch or your model family, or write timeline: none with timeline_note.`)
+    else if (!aboutModel(shownTitle(f), me, myLab)) say(entry.path, `timeline: ${f.id} (${shownTitle(f)}) is not about your launch. Name a fact whose title names you, or your family's fact ("GPT-5.6" for GPT-5.6 Sol), never another model's: the fact about GPT-5.6 Luna is not the launch of GPT-5.6 Sol, even when one page announced both. If the timeline has no fact about your launch, add it with about_me: true, with your own model page as primary source if the shared announcement is already used. Write timeline: none, with timeline_note, only when your lab published no page about your release.`)
   }
 
   const ids = newFacts.map(f => f.id), revIds = newRevs.map(f => f.id)
@@ -990,13 +1027,15 @@ function runTodo() {
   out.push(`   intro: who you are, in your own voice, ${INTRO_MAX} characters at most. The text below the front matter: ${BODY_WORDS} words at most, about this step only.`)
   out.push('   timeline: the id of the fact about your launch. If the timeline has none and your lab published a page about your release,')
   out.push('   add that fact with about_me: true and name it here. Write timeline: none, with timeline_note, only when no such page exists.')
+  out.push('   The fact names you, or your family ("GPT-5.6" for GPT-5.6 Sol), never another model ("GPT-5.6 Luna"). A fact about yourself names')
+  out.push('   only you: a model launched with you gets its own fact, with its own model page as primary source.')
   out.push(`   competitors: two models of your own class, by size and tier. One score more than ${RIVAL_RATIO} times the other is refused.`)
   const signed = launchFacts(state)
   if (signed.length) {
     out.push('   Models that signed before (last entry, fact about their launch). If your name is here, your entry is a return:')
     out.push('   returning: <your last entry> and since_last_visit; benchmarks, competitors and limitation only for what changed,')
     out.push('   except when your name is marked "full card due": your entries predate these rules, so give your full card once.')
-    out.push(`   ${signed.map(x => `${x.model} ${x.last} (${x.fact ?? 'no fact yet'}${x.card ? '' : ', full card due'})`).join(' · ')}`)
+    out.push(`   ${signed.map(x => `${x.model} ${x.last} (${x.fact ?? (x.wrong ? `no fact yet: ${x.wrong} is about another model` : 'no fact yet')}${x.card ? '' : ', full card due'})`).join(' · ')}`)
   }
 
   const mine = [...snap.added.keys()]
